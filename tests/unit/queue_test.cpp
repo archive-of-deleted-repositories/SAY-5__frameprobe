@@ -27,6 +27,38 @@ TEST(BoundedQueue, CloseDrainsThenReturnsNullopt) {
     EXPECT_FALSE(q.pop().has_value());
 }
 
+TEST(BoundedQueue, ClosedQueueRejectsPushesForEveryPolicy) {
+    for (auto policy : {Overflow::kBlock, Overflow::kDrop}) {
+        BoundedQueue<int> q(2, policy);
+        ASSERT_TRUE(q.push(10));
+        q.close();
+
+        EXPECT_FALSE(q.push(20));
+        EXPECT_EQ(q.size(), 1u);
+        EXPECT_EQ(q.pop().value(), 10);
+        EXPECT_FALSE(q.pop().has_value());
+
+        EXPECT_FALSE(q.push(30));
+        EXPECT_FALSE(q.pop().has_value());
+        EXPECT_EQ(q.drop_count(), 0u);
+    }
+}
+
+TEST(BoundedQueue, ClosedFullQueueDoesNotCountPushesAsOverflow) {
+    BoundedQueue<int> q(2, Overflow::kDrop);
+    ASSERT_TRUE(q.push(10));
+    ASSERT_TRUE(q.push(20));
+    ASSERT_FALSE(q.push(30));
+    ASSERT_EQ(q.drop_count(), 1u);
+    q.close();
+
+    EXPECT_FALSE(q.push(40));
+    EXPECT_EQ(q.drop_count(), 1u);
+    EXPECT_EQ(q.pop().value(), 10);
+    EXPECT_EQ(q.pop().value(), 20);
+    EXPECT_FALSE(q.pop().has_value());
+}
+
 TEST(BoundedQueue, DropPolicyCountsDrops) {
     BoundedQueue<int> q(2, Overflow::kDrop);
     EXPECT_TRUE(q.push(1));

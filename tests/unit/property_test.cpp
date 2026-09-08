@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <map>
 #include <memory>
 #include <random>
 #include <set>
@@ -9,37 +8,54 @@
 
 #include "detect/serialize.h"
 #include "detect/stub_detector.h"
+#include "pipeline/decoder.h"
 #include "pipeline/harness.h"
+#include "pipeline/inference.h"
+#include "pipeline/sink.h"
 #include "source/synthetic_source.h"
 
 using namespace frameprobe;
 
 namespace {
 
-// Runs the full pipeline with the given worker count and returns the detections
-// the sink emitted, keyed by frame index (so reordering is normalised away and
-// we compare pure detection content).
-std::map<std::uint64_t, DetectionResult> run_collect(int workers, std::uint64_t frames) {
+// Connect the production stages directly to observe the sink's existing emit
+// callback: Harness only exposes aggregate statistics, not detection results.
+std::vector<DetectionResult> run_collect(int workers, std::uint64_t frames) {
     StubConfig sc;
     sc.stream.frames = frames;
     sc.compute_us = 10;
 
-    PipelineConfig cfg;
-    cfg.target_fps = 1000.0;
-    cfg.queue_capacity = 8;
-    cfg.inference_workers = workers;
+    SyntheticSource source(sc.stream);
+    StubDetector detector(sc);
+    BoundedQueue<FrameEnvelope> frame_q(8);
+    BoundedQueue<ResultEnvelope> result_q(16);
+    Decoder decoder(source, frame_q);
+    FrameStats stats;
+    Sink sink(result_q, stats);
+    std::vector<DetectionResult> got;
+    sink.set_emit([&](const ResultEnvelope& env) { got.push_back(env.result); });
 
-    std::map<std::uint64_t, DetectionResult> got;
-    // The harness records stats but does not expose per-frame results, so we
-    // mirror the deterministic oracle: the detector output is a pure function of
-    // frame index, which is exactly the property under test. We assert that
-    // oracle is stable AND that the pipeline processes every frame.
-    Harness h(std::make_unique<SyntheticSource>(sc.stream), std::make_unique<StubDetector>(sc),
-              cfg);
-    FrameStats s = h.run();
-    EXPECT_EQ(s.processed(), frames);
-    for (std::uint64_t i = 0; i < frames; ++i) {
-        got[i] = StubDetector::scripted(sc, i);
+    std::thread decoder_thread([&] { decoder.run(); });
+    std::vector<std::thread> worker_threads;
+    for (int i = 0; i < workers; ++i) {
+        worker_threads.emplace_back([&] {
+            InferenceWorker worker(frame_q, result_q, detector);
+            worker.run();
+        });
+    }
+    std::thread sink_thread([&] { sink.run(); });
+
+    decoder_thread.join();
+    for (auto& thread : worker_threads)
+        thread.join();
+    result_q.close();
+    sink_thread.join();
+
+    EXPECT_EQ(stats.processed(), frames);
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_EQ(got[i].frame_index, i);
+        EXPECT_EQ(got[i].detections, StubDetector::scripted(sc, i).detections)
+            << "workers=" << workers << " frame=" << i;
     }
     return got;
 }

@@ -31,6 +31,8 @@ class BoundedQueue {
     // closed.
     bool push(T value) {
         std::unique_lock<std::mutex> lk(mu_);
+        if (closed_)
+            return false;
         if (policy_ == Overflow::kDrop) {
             if (q_.size() >= capacity_) {
                 drop_count_.fetch_add(1, std::memory_order_relaxed);
